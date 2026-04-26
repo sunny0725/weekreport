@@ -18,7 +18,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { HwpxDocument } from "@/lib/hwpx-extractor";
 
-export const maxDuration = 300;
+export const maxDuration = 60; // Vercel 무료 플랜 한도
 
 /* ────────────────────────────────────────────
    내장 주간보고 서식 정의

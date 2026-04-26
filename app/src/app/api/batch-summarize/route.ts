@@ -18,7 +18,7 @@ import {
 } from "@/lib/batch-summarizer";
 import type { HwpxDocument } from "@/lib/hwpx-extractor";
 
-export const maxDuration = 300; // Vercel: 최대 5분
+export const maxDuration = 60; // Vercel 무료 플랜 한도
 
 export async function POST(req: NextRequest) {
   try {
