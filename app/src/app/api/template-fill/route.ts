@@ -1,13 +1,9 @@
 /**
  * POST /api/template-fill
  *
- * 소스 HWPX(들)에서 내용을 추출 → AI 요약 → 내장 서식으로 HWPX 생성
- * 생성된 HWPX는 브라우저로 다운로드되며 서버 output/ 폴더에도 저장됩니다.
- *
- * Request: multipart/form-data
- *   sources : File[]  (내용을 추출할 HWPX, 최대 5개)
- *
- * Response: application/hwpx (완성된 HWPX)
+ * 소스 HWPX(들)에서 내용을 추출 → AI 요약 → 실제 HWPX 구조 기반으로 보고서 생성
+ * 베이스 템플릿(base-template.hwpx)의 header.xml 등 구조를 유지하고
+ * section0.xml 내용만 교체하므로 한글에서 정상 열립니다.
  */
 import { NextRequest, NextResponse } from "next/server";
 import { extractMultipleHwpx } from "@/lib/hwpx-extractor";
@@ -20,9 +16,6 @@ import type { HwpxDocument } from "@/lib/hwpx-extractor";
 
 export const maxDuration = 60; // Vercel 무료 플랜 한도
 
-/* ────────────────────────────────────────────
-   내장 주간보고 서식 정의
-   ──────────────────────────────────────────── */
 type ReportFields = {
   teamName:    string;
   weekLabel:   string;
@@ -40,84 +33,83 @@ function escXml(s: string) {
     .replace(/>/g, "&gt;");
 }
 
-/** 추출된 필드로 올바른 OWPML 구조의 HWPX 바이트를 생성 */
-async function buildHwpxFromFields(fields: ReportFields): Promise<Buffer> {
+/**
+ * 베이스 템플릿 HWPX를 로드하고 section0.xml만 교체해서 반환
+ * → header.xml, META-INF/*, content.hpf 등 Hangul 필수 구조 유지
+ */
+async function buildHwpxFromTemplate(fields: ReportFields): Promise<Buffer> {
+  // 베이스 템플릿 로드 (실제 Hancom HWPX 구조)
+  const templatePath = path.join(process.cwd(), "src", "lib", "base-template.hwpx");
+  const templateBuf  = await fs.readFile(templatePath);
+  const zip = await JSZip.loadAsync(Buffer.from(templateBuf));
+
+  // 본문 단락 구성
   const paragraphs: string[] = [
     "경영현안회의 주간업무보고",
     `팀명: ${fields.teamName}`,
     `보고 주차: ${fields.weekLabel}`,
     `보고일: ${fields.reportDate}`,
-    "1. 금주 실적",
-    ...(fields.thisWeek || "").split(/[;\n]+/).map((s) => s.trim()).filter(Boolean),
-    "2. 차주 계획",
-    ...(fields.nextWeek || "").split(/[;\n]+/).map((s) => s.trim()).filter(Boolean),
-    "3. 이슈 및 리스크",
+    "",
+    "【 금주 실적 】",
+    ...(fields.thisWeek || "").split(/[;\n]+/).map(s => s.trim()).filter(Boolean),
+    "",
+    "【 차주 계획 】",
+    ...(fields.nextWeek || "").split(/[;\n]+/).map(s => s.trim()).filter(Boolean),
+    "",
+    "【 이슈 및 리스크 】",
     fields.issues || "해당 없음",
-    "4. 핵심 성과",
+    "",
+    "【 핵심 성과 】",
     fields.achievement || "해당 없음",
   ];
 
-  /* ── 올바른 OWPML 네임스페이스로 section0.xml 생성 ── */
-  const pNodes = paragraphs
-    .map(
-      (text, i) => `  <hp:p id="${i + 1}">
-    <hp:pPr><hp:pStyle paraPrIDRef="0"/></hp:pPr>
-    <hp:run><hp:runPr/><hp:t>${escXml(text)}</hp:t></hp:run>
-  </hp:p>`
-    )
-    .join("\n");
+  // 기존 section0.xml에서 네임스페이스 선언 추출 (실제 파일 기반)
+  const origSec = await zip.file("Contents/section0.xml")!.async("string");
+  const nsMatch  = origSec.match(/<hs:sec([^>]+)>/);
+  const nsAttrs  = nsMatch ? nsMatch[1] : ` xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"`;
 
-  // 루트는 <hs:sec> — section 네임스페이스 (paragraph 아님)
-  const sectionXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
-        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
-${pNodes}
-</hs:sec>`;
+  // 단락 XML 생성 (기존 파일의 단락 구조 참고)
+  const pXml = paragraphs.map((text, i) => {
+    const pid = 100 + i;
+    if (text === "") {
+      // 빈 줄
+      return `<hp:p id="${pid}"><hp:pPr><hp:pStyle paraPrIDRef="0"/></hp:pPr><hp:run><hp:runPr/><hp:t/></hp:run></hp:p>`;
+    }
+    const isBold = text.startsWith("【") || i === 0;
+    return `<hp:p id="${pid}"><hp:pPr><hp:pStyle paraPrIDRef="0"/></hp:pPr><hp:run><hp:runPr>${isBold ? '<hp:bold/>' : ''}</hp:runPr><hp:t>${escXml(text)}</hp:t></hp:run></hp:p>`;
+  }).join("");
 
-  // Hancom Package Format (ePub OPF 아님)
-  const contentHpf = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<hpf:package xmlns:hpf="http://www.hancom.co.kr/hwpml/2011/package">
-  <hpf:metadata/>
-  <hpf:manifest>
-    <hpf:item id="section0" href="section0.xml" media-type="application/xml"/>
-  </hpf:manifest>
-  <hpf:spine>
-    <hpf:itemref idref="section0"/>
-  </hpf:spine>
-</hpf:package>`;
+  const newSectionXml =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>` +
+    `<hs:sec${nsAttrs}>${pXml}</hs:sec>`;
 
-  // container.xml — ZIP 리더가 진입점을 찾는 필수 파일
-  const containerXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<rootFiles>
-  <rootFile fullPath="Contents/content.hpf"/>
-</rootFiles>`;
+  zip.file("Contents/section0.xml", newSectionXml);
 
-  const versionXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<ver:versionsupport xmlns:ver="http://www.hancom.co.kr/hwpml/2011/version">
-  <ver:version>1.3</ver:version>
-</ver:versionsupport>`;
+  // content.hpf 메타데이터 업데이트 (제목)
+  const hpf = await zip.file("Contents/content.hpf")!.async("string");
+  const newHpf = hpf.replace(
+    /<opf:title>[^<]*<\/opf:title>/,
+    `<opf:title>${escXml(`${fields.weekLabel} ${fields.teamName} 주간보고`)}</opf:title>`
+  );
+  zip.file("Contents/content.hpf", newHpf);
 
-  const zip = new JSZip();
-  // mimetype 은 반드시 압축 없이(STORE) 첫 번째로 추가
-  zip.file("mimetype", "application/hwp+zip", { compression: "STORE" });
-  zip.file("version.xml",               versionXml);
-  zip.file("META-INF/container.xml",    containerXml);
-  zip.file("Contents/content.hpf",      contentHpf);
-  zip.file("Contents/section0.xml",     sectionXml);
+  // Preview 텍스트 업데이트 (선택)
+  const prvText = paragraphs.filter(p => p).join("\n");
+  if (zip.file("Preview/PrvText.txt")) {
+    zip.file("Preview/PrvText.txt", prvText);
+  }
 
   return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
-/** output 디렉토리에 파일 저장 (없으면 생성) */
-async function saveToOutputDir(buf: Buffer, fileName: string): Promise<string> {
-  const outputDir = process.env.REPORT_OUTPUT_DIR
-    ? path.resolve(process.cwd(), process.env.REPORT_OUTPUT_DIR)
-    : path.resolve(process.cwd(), "output");
-
+/** output 디렉토리에 파일 저장 */
+async function saveToOutputDir(buf: Buffer, fileName: string): Promise<void> {
+  const outputDir = path.resolve(
+    process.cwd(),
+    process.env.REPORT_OUTPUT_DIR ?? "output"
+  );
   await fs.mkdir(outputDir, { recursive: true });
-  const filePath = path.join(outputDir, fileName);
-  await fs.writeFile(filePath, buf);
-  return filePath;
+  await fs.writeFile(path.join(outputDir, fileName), buf);
 }
 
 export async function POST(req: NextRequest) {
@@ -133,7 +125,7 @@ export async function POST(req: NextRequest) {
     /* ── 1. 텍스트 추출 ── */
     const sourceBuffers = await Promise.all(
       sourceFiles.map(async (f) => ({
-        name: f.name,
+        name:   f.name,
         buffer: Buffer.from(await f.arrayBuffer()),
       }))
     );
@@ -195,28 +187,22 @@ export async function POST(req: NextRequest) {
 
     const fields = JSON.parse(jsonMatch[0]) as ReportFields;
 
-    /* ── 3. HWPX 생성 ── */
-    const hwpxBuf = await buildHwpxFromFields(fields);
+    /* ── 3. HWPX 생성 (베이스 템플릿 기반) ── */
+    const hwpxBuf = await buildHwpxFromTemplate(fields);
 
-    const dateStr   = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-    const baseName  = `${fields.weekLabel || dateStr}_${fields.teamName || "주간보고"}_통합.hwpx`;
+    const dateStr  = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const baseName = `${fields.weekLabel || dateStr}_${fields.teamName || "주간보고"}_통합.hwpx`;
 
-    /* ── 4. 서버 output/ 폴더에 저장 ── */
-    try {
-      await saveToOutputDir(hwpxBuf, baseName);
-    } catch (saveErr) {
-      console.warn("[template-fill] output 저장 실패:", saveErr);
-      // 저장 실패해도 다운로드는 계속 진행
-    }
-
-    const outName = encodeURIComponent(baseName);
+    /* ── 4. 서버 저장 (실패해도 다운로드 계속) ── */
+    saveToOutputDir(hwpxBuf, baseName).catch((e) =>
+      console.warn("[template-fill] output 저장 실패:", e)
+    );
 
     return new NextResponse(new Uint8Array(hwpxBuf), {
       status: 200,
       headers: {
         "Content-Type":        "application/octet-stream",
-        "Content-Disposition": `attachment; filename*=UTF-8''${outName}`,
-        "X-Output-Filename":   outName,
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(baseName)}`,
       },
     });
   } catch (err) {
